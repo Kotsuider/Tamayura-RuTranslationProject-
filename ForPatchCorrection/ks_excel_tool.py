@@ -11,9 +11,13 @@ POST_RE = re.compile(r'((?:\[(?:np|l|ll|p|r|label|cm|hr|hide|show|s|sq|endlink)\
 PRE_RE = re.compile(r'^((?:\[(?:name|vo)\s+[^\]]*\]|\[r\]|\s)+)')
 
 DEFAULT_WRAP_WIDTH = 44
+PAGE_MARKER = '[PEREN]'
+# An inline page break keeps the name layer and the current voice playing.
+PAGE_BREAK = '[p][er]'
 WRAP_TOKEN_RE = re.compile(rf'{TAG_RE.pattern}|[ \t]+|[^ \t\[]+|\[')
-LINE_RESET_RE = re.compile(r'\[(?:r|np|cm|ct|er)\b')
+LINE_RESET_RE = re.compile(r'\[(?:r|np|cm|ct|er|PEREN)\b')
 LINE_WAIT_RE = re.compile(r'\[(?:l|ll)\b')
+MESSAGE_MODE_RE = re.compile(r'^[@\[](avg|novel)(?=\s|\]|$)')
 NO_LINE_START = frozenset(".,!?:;…)]}—–-")
 KEEP_WITH_NEXT = frozenset("а в во до за и из к ко на над не ни но о об от по под при с со у".split())
 
@@ -330,7 +334,7 @@ def wrap_text_kag(text, width, column=0):
 
 
 def render_scenario(ks_path, md_path, name_map=None, *, wrap_width=DEFAULT_WRAP_WIDTH):
-    """Inserts translations from Markdown into .ks and returns UTF-16LE bytes."""
+    """Insert translations and return a BOM-prefixed UTF-16 scenario."""
     name_map = name_map or DEFAULT_NAMES
     raw = ks_path.read_bytes()
     orig_lines = raw.decode('cp932').splitlines(keepends=True)
@@ -341,23 +345,35 @@ def render_scenario(ks_path, md_path, name_map=None, *, wrap_width=DEFAULT_WRAP_
     in_script = False
     replaced = 0
     column = 0
+    mode = 'avg'
+    pending = None
+
+    def flush_pending():
+        nonlocal column, pending
+        if pending is None:
+            return
+        pre, fragments, post, newline = pending
+        if LINE_RESET_RE.search(pre):
+            column = 0
+        text = PAGE_MARKER.join(part.strip() for part in ' '.join(fragments).split(PAGE_MARKER))
+        target, column = wrap_text_kag(text, wrap_width, column)
+        out_lines.append(pre + target.replace(PAGE_MARKER, PAGE_BREAK) + post + newline)
+        if not post.endswith('\\') or LINE_RESET_RE.search(post):
+            column = 0
+        pending = None
 
     for idx, line in enumerate(orig_lines):
         s = line.strip()
         if s in ('@iscript', '[iscript]'):
             in_script = True
-            out_lines.append(line)
-            continue
+        parsed = None if in_script else parse_line(line)
         if s in ('@endscript', '[endscript]'):
             in_script = False
-            out_lines.append(line)
-            continue
-        if in_script:
-            out_lines.append(line)
-            continue
-
-        parsed = parse_line(line)
         if not parsed:
+            flush_pending()
+            if not in_script and (mode_match := MESSAGE_MODE_RE.match(s)):
+                mode = mode_match[1]
+                column = 0
             out_lines.append(line)
             continue
 
@@ -370,11 +386,11 @@ def render_scenario(ks_path, md_path, name_map=None, *, wrap_width=DEFAULT_WRAP_
         # A physical newline advances the message unless escaped with \.
         # The page/return commands in Post also reset the visible column.
         continues = s.endswith('\\') and not LINE_RESET_RE.search(parsed['post'])
-        if LINE_RESET_RE.search(parsed['pre']) or parsed['type'] == 'choice':
-            column = 0
-
         if not target:
             # Preserve the Japanese source verbatim, including in a partial build.
+            flush_pending()
+            if LINE_RESET_RE.search(parsed['pre']):
+                column = 0
             out_lines.append(line)
             if continues and parsed['type'] != 'choice':
                 body = re.sub(r'\(\(.*?\)\)', '', parsed['text'])
@@ -387,11 +403,6 @@ def render_scenario(ks_path, md_path, name_map=None, *, wrap_width=DEFAULT_WRAP_
 
         # Replace literal \n with KAG newline tag [r].
         target = target.replace(r'\n', '[r]')
-        if wrap_width and parsed['type'] != 'choice':
-            target, column = wrap_text_kag(target, wrap_width, column)
-        if not continues:
-            column = 0
-
         # Determine speaker translation
         speaker = parsed['speaker']
         char_row = row['character']
@@ -403,17 +414,37 @@ def render_scenario(ks_path, md_path, name_map=None, *, wrap_width=DEFAULT_WRAP_
 
         newline = '\r\n' if line.endswith('\r\n') else '\n'
 
+        pre, post = parsed['pre'], parsed['post']
         if parsed['type'] == 'choice':
-            new_line = parsed['pre'] + target + parsed['post'] + newline
-        elif parsed['type'] == 'dialogue':
-            pre = parsed['pre']
-            if translated_speaker and translated_speaker != speaker:
-                pre = re.sub(r'\[name\s+txt=[\"\']?[^\"\'\]]+[\"\']?\]', f'[name txt="{translated_speaker}"]', pre)
-            new_line = pre + target + parsed['post'] + newline
-        else:
-            new_line = parsed['pre'] + target + parsed['post'] + newline
+            if PAGE_MARKER in target:
+                raise ValueError(f'{md_path.name}:{row["row_idx"]}: {PAGE_MARKER} cannot split a choice')
+            flush_pending()
+            out_lines.append(pre + target + post + newline)
+            column = 0
+            continue
+        if translated_speaker and translated_speaker != speaker:
+            pre = NAME_RE.sub(lambda _: f'[name txt="{translated_speaker}"]', pre)
 
-        out_lines.append(new_line)
+        # Consecutive translated rows may be fragments of one displayed block.
+        # A command at either side can change the display or wait for input.
+        if wrap_width and pending is not None and not pre:
+            block_pre, fragments, previous_post, _ = pending
+            previous_text = TAG_RE.sub('', fragments[-1]).rstrip()
+            next_text = TAG_RE.sub('', target).lstrip()
+            # NVL keeps sentence breaks. An unfinished phrase can also span
+            # two rows without a comma, as in "просто грех / держать в тылу".
+            continues_phrase = previous_text.endswith(',') or (
+                bool(previous_text) and previous_text[-1].isalnum() and next_text[:1].islower()
+            )
+            if previous_post in ('', '\\') and (mode == 'avg' or continues_phrase):
+                fragments.append(target)
+                pending = (block_pre, fragments, post, newline)
+                continue
+
+        flush_pending()
+        pending = (pre, [target], post, newline)
+
+    flush_pending()
 
     if (extra := next(md_iter, None)) is not None:
         raise ValueError(f'{md_path.name}:{extra["row_idx"]}: extra unused row in Markdown')
